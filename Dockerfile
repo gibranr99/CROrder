@@ -1,42 +1,33 @@
-# ==== Dockerfile TODO-EN-UNO: Webapp Flask + OCR + Email .MSG ====
-# Construir:
-#   docker build -t ocr-msg:latest .
-# Ejecutar local:
-#   docker run --rm -p 8000:8000 ocr-msg:latest
-# Abre: http://localhost:8000
-
+# ==== Dockerfile TODO-EN-UNO: Webapp Flask + OCR + Email (.EML) ====
 FROM python:3.12-slim
 
-# Evitar prompts y mejorar logging de Python
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Dependencias de sistema (Tesseract OCR + utilidades)
+# Dependencias del sistema (Tesseract + libs de imagen)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
+    tesseract-ocr tesseract-ocr-spa \
     libglib2.0-0 libsm6 libxrender1 libxext6 \
-    ca-certificates curl \
-    libmagic1 \
+    libmagic1 ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ====== requirements.txt (heredoc) ======
+# ====== requirements.txt ======
 RUN cat <<'REQ' > requirements.txt
 Flask==3.0.3
 pillow==10.4.0
 pytesseract==0.3.13
 opencv-python-headless==4.10.0.84
-msgbuilder==0.9.3
 python-magic==0.4.27
 gunicorn==22.0.0
 REQ
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ====== app.py (heredoc) ======
+# ====== app.py ======
 RUN cat <<'PY' > app.py
 from flask import Flask, request, redirect, url_for, send_file, render_template_string
 from io import BytesIO
@@ -48,8 +39,9 @@ import re
 import os
 import base64
 
+# Intento opcional de msgbuilder (no instalado); si alguna vez lo agregas, la app podrá exportar .MSG
 try:
-    from msgbuilder import Message as MsgMessage
+    from msgbuilder import Message as MsgMessage  # type: ignore
     HAS_MSGBUILDER = True
 except Exception:
     HAS_MSGBUILDER = False
@@ -62,7 +54,7 @@ INDEX_HTML = """\
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>OCR a Email (.MSG)</title>
+  <title>OCR a Email</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial; margin: 24px; }
     .card { max-width: 920px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 16px; box-shadow: 0 5px 14px rgba(0,0,0,.06); }
@@ -83,8 +75,8 @@ INDEX_HTML = """\
 <body>
   <div class="card">
     <h1>Subir imagen → Extraer producto y cantidad → Generar email</h1>
-    <p>Sube una captura/nota/recibo. Intentaré detectar <span class="kpi">Producto</span> y <span class="kpi">Cantidad</span> con OCR.
-      Luego podrás descargar un correo <b>.MSG</b> para Outlook (con fallback a <b>.EML</b>).</p>
+    <p>Sube una captura/nota/recibo. Detecto <span class="kpi">Producto</span> y <span class="kpi">Cantidad</span> con OCR.
+      Puedes descargar un correo <b>.EML</b> (Outlook/Thunderbird/Apple Mail).</p>
 
     <form id="upload-form" action="{{ url_for('process') }}" method="post" enctype="multipart/form-data">
 
@@ -124,9 +116,11 @@ INDEX_HTML = """\
       <div>Producto: <b>{{ product }}</b></div>
       <div>Cantidad: <b>{{ quantity }}</b></div>
       <div style="margin-top:10px;">
-        <a href="{{ url_for('download_msg', token=token) }}"><button>Descargar .MSG</button></a>
+        {% if has_msg %}
+          <a href="{{ url_for('download_msg', token=token) }}"><button>Descargar .MSG</button></a>
+        {% endif %}
         {% if has_eml %}
-        <a href="{{ url_for('download_eml', token=token) }}"><button class="secondary">Descargar .EML</button></a>
+          <a href="{{ url_for('download_eml', token=token) }}"><button class="secondary">Descargar .EML</button></a>
         {% endif %}
       </div>
     </div>
@@ -148,8 +142,7 @@ def preprocess_for_ocr(pil_image: Image.Image) -> Image.Image:
     return Image.fromarray(th)
 
 def extract_product_and_qty(ocr_text: str):
-    text = ocr_text
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
 
     patterns = [
         re.compile(r"^(?P<qty>\d{1,3})\s*[xX×*]\s*(?P<prod>.+)$"),
@@ -162,9 +155,7 @@ def extract_product_and_qty(ocr_text: str):
         for pat in patterns:
             m = pat.search(ln)
             if m:
-                prod = m.group('prod').strip()
-                qty = int(m.group('qty'))
-                return prod, qty
+                return m.group('prod').strip(), int(m.group('qty'))
 
     def is_prod_like(s):
         return len(s) >= 5 and re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", s)
@@ -190,10 +181,12 @@ def extract_product_and_qty(ocr_text: str):
 
     return "(No detectado)", 1
 
-def build_msg_file(sender: str, to: str, subject: str, body_html: str, attachment_name: str, attachment_bytes: bytes):
+def build_msg_file(*args, **kwargs):
+    # Solo funcionará si alguna vez agregas msgbuilder a la imagen.
     if not HAS_MSGBUILDER:
         return None
     try:
+        sender, to, subject, body_html, attachment_name, attachment_bytes = args
         msg = MsgMessage()
         msg.set_sender(sender)
         msg.add_recipient(to)
@@ -279,16 +272,17 @@ def process():
     """
 
     msg_stream = build_msg_file(sender, to, f"{subject}: {product} x{qty}", body_html, "captura.png", png_bytes)
+    has_msg = msg_stream is not None
     has_eml = False
 
-    if msg_stream is not None:
+    if has_msg:
         token = save_blob("correo.msg", msg_stream.getvalue())
     else:
         eml_stream = build_eml_file(sender, to, f"{subject}: {product} x{qty}", body_html, "captura.png", png_bytes)
         token = save_blob("correo.eml", eml_stream.getvalue())
         has_eml = True
 
-    return render_template_string(INDEX_HTML, product=product, quantity=qty, token=token, has_eml=has_eml)
+    return render_template_string(INDEX_HTML, product=product, quantity=qty, token=token, has_msg=has_msg, has_eml=has_eml)
 
 @app.route('/download.msg')
 def download_msg():
@@ -307,7 +301,7 @@ def download_eml():
     if not blob:
         return "Token inválido", 404
     if not blob['name'].lower().endswith('.eml'):
-        return "No hay .EML para este proceso (usa .MSG)", 400
+        return "No hay .EML para este proceso", 400
     return send_file(BytesIO(blob['data']), mimetype='message/rfc822', as_attachment=True, download_name='correo.eml')
 
 @app.get('/healthz')
@@ -319,6 +313,5 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 PY
 
-# Exponer puerto y arrancar con gunicorn (usa $PORT si existe, p.ej. en Render/Fly/Heroku)
 EXPOSE 8000
 CMD ["sh","-c","gunicorn -w 2 -b 0.0.0.0:${PORT:-8000} app:app"]
